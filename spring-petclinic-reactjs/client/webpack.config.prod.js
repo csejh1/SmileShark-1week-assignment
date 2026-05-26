@@ -23,7 +23,7 @@ module.exports = {
       'process.env': {
         'NODE_ENV': JSON.stringify('production'),
       },
-      __API_SERVER_URL__: JSON.stringify('https://api.rapa11.store/petclinic')
+      __API_SERVER_URL__: JSON.stringify('https://www.awsrapa11.cloud/petclinic')
     })
   ],
   resolve: {
