@@ -49,7 +49,7 @@ jobs:
 
       - name: Install Dependencies
         working-directory: spring-petclinic-reactjs/client
-        run: npm ci
+        run: npm ci --legacy-peer-deps
 
       - name: Build React App
         working-directory: spring-petclinic-reactjs/client
