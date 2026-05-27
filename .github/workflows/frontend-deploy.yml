@@ -1,0 +1,47 @@
+name: Frontend Deploy
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'spring-petclinic-reactjs/client/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_ARN }}
+  S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+  CF_DISTRIBUTION_ID: ${{ secrets.CF_DISTRIBUTION_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Dependencies
+        working-directory: spring-petclinic-reactjs/client
+        run: npm install --legacy-peer-deps
+
+      - name: Build
+        working-directory: spring-petclinic-reactjs/client
+        run: npm run build:prod
+
+      - name: Sync to S3
+        run: aws s3 sync spring-petclinic-reactjs/client/public/ s3://$S3_BUCKET/ --delete
+
+      - name: Invalidate CloudFront Cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id $CF_DISTRIBUTION_ID \
+            --paths "/*"

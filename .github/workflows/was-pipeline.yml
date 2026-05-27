@@ -1,0 +1,32 @@
+name: WAS Pipeline Trigger
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'spring-petclinic-reactjs/src/**'
+      - 'spring-petclinic-reactjs/pom.xml'
+      - 'spring-petclinic-reactjs/Dockerfile'
+      - 'spring-petclinic-reactjs/buildspec.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_ARN }}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger WAS Pipeline
+        run: aws codepipeline start-pipeline-execution --name petclinic-was-pipeline
