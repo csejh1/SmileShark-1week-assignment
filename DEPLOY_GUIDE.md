@@ -2205,3 +2205,296 @@ IAM → 역할 → `AWSCodePipelineServiceRole-ap-northeast-2-petclinic-was-pipe
 
 > `iam:PassRole`은 `Resource: "*"`이지만 `StringEqualsIfExists` 조건으로 ECS 서비스로만 패스 가능하도록 제한 — 이것이 핵심 최소권한 제어 지점.
 > WAS, WEB 두 파이프라인 서비스 역할 모두에 동일하게 적용.
+
+---
+
+### 17. WEB → WAS 502 Bad Gateway — nginx resolver와 Service Connect 비호환
+
+**단계**: 배포 완료 후 API 호출 시
+
+**증상**
+사이트 메인페이지는 정상 로드되나 데이터가 표시되지 않음. nginx WEB 컨테이너 로그에서 아래 오류 반복:
+```
+[error] could not be resolved (110: Operation timed out) while sending to client
+```
+또는
+```
+[error] no resolver defined to resolve was.petclinic-ns while sending to client
+```
+브라우저에서 API 응답은 502 Bad Gateway.
+
+**원인**
+`nginx.conf`에 `resolver 169.254.169.253`(VPC DNS)을 명시하면 nginx가 **시스템 resolver를 완전히 우회**하고 VPC DNS에 직접 질의한다.
+
+ECS Service Connect는 Route 53에 DNS 레코드를 생성하지 않는다:
+> *"Service Connect doesn't use or create DNS hosted zones in Amazon Route 53."*
+> — [AWS ECS Service Connect 공식 문서](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect-concepts.html)
+
+따라서 VPC DNS에 `was` 또는 `was.petclinic-ns` 레코드가 존재하지 않아 resolution 실패 → 502 발생.
+
+Service Connect의 실제 동작 방식:
+- 각 ECS 태스크에 **Envoy 사이드카**가 주입됨
+- Envoy가 태스크 네트워크 네임스페이스의 iptables 규칙을 통해 아웃바운드 트래픽을 인터셉트
+- 애플리케이션이 `was:9966`으로 연결 시도 → Envoy가 가로채 실제 WAS 태스크로 라우팅
+- *"Applications only use the proxy to connect to Service Connect endpoints. There is no additional configuration to use the proxy."*
+> — [AWS ECS Service Connect 공식 문서](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect.html)
+
+**해결**
+
+`spring-petclinic-reactjs/web/nginx.conf` 수정:
+
+```nginx
+# 변경 전 (문제)
+server {
+    listen 80;
+    resolver 169.254.169.253 valid=10s ipv6=off;  # VPC DNS 직접 질의 → was 레코드 없음
+    location /petclinic/ {
+        set $backend http://was.petclinic-ns:9966;
+        proxy_pass $backend;
+        ...
+    }
+}
+
+# 변경 후 (정상)
+upstream was {
+    server was:9966;  # 시스템 resolver 사용 → Envoy가 인터셉트
+}
+server {
+    listen 80;
+    location /petclinic/ {
+        proxy_pass http://was;
+        ...
+    }
+}
+```
+
+`resolver` 지시어를 제거하면 nginx가 시스템 resolver(`/etc/resolv.conf`)를 사용하게 되고, Envoy 사이드카가 해당 연결을 인터셉트해 WAS로 정상 라우팅한다.
+
+추가로 `spring-petclinic-reactjs/web/Dockerfile`에 startup delay 추가:
+
+```dockerfile
+# 변경 전
+CMD ["nginx", "-g", "daemon off;"]
+
+# 변경 후
+CMD ["/bin/sh", "-c", "sleep 10 && exec nginx -g 'daemon off;'"]
+```
+
+nginx가 시작할 때 Envoy 사이드카가 아직 준비되지 않으면 `was` resolve가 실패할 수 있으므로 10초 대기 후 nginx를 기동.
+
+> **주의**: WEB ECS 서비스에 Service Connect **클라이언트 구성**이 활성화되어 있어야 Envoy 사이드카가 주입된다. 콘솔 → ECS → 서비스 → 서비스 연결 탭에서 확인.
+
+---
+
+### 18. nginx upstream "host not found" — Service Connect와 nginx 구조적 비호환 확인
+
+**단계**: 트러블슈팅 #17 해결 시도 후
+
+**증상**
+`resolver` 제거 + `upstream was { server was:9966; }` 방식으로 변경 후 WEB 태스크가 시작되자마자 롤백:
+```
+[emerg] host not found in upstream "was:9966" in /etc/nginx/conf.d/default.conf:2
+nginx: [emerg] host not found in upstream "was:9966"
+```
+`sleep 10` startup delay를 줘도 동일하게 실패.
+
+**원인 분석**
+nginx `upstream` 블록은 **프로세스 시작 시 단 한 번 DNS resolve**를 시도한다. resolve 실패 시 nginx 자체가 기동되지 않는다.
+
+AWS 공식 문서 확인 결과:
+> *"The Cloud Map services that Service Connect creates aren't discoverable by using the DNS-based service discovery of Cloud Map."*
+
+Service Connect가 관리하는 Cloud Map 서비스는 **DNS 타입 네임스페이스여도 DNS 쿼리로 resolve되지 않는다.** Envoy 사이드카의 iptables 인터셉트 방식으로만 동작하며, 이는 nginx의 upstream 선언 방식과 구조적으로 호환되지 않는다.
+
+| 방식 | 결과 | 이유 |
+|------|------|------|
+| `resolver` + `$backend` | 실패 | VPC DNS에 `was` 레코드 없음 |
+| `upstream was` (static) | 실패 | 시작 시 DNS resolve 불가, nginx 기동 거부 |
+
+**해결: Internal ALB 도입**
+
+WEB → WAS 구간에 Internal ALB를 추가하여 nginx가 ALB DNS 이름(VPC DNS로 정상 resolve 가능)을 통해 WAS에 접근하도록 아키텍처를 변경한다.
+
+변경 후 아키텍처:
+```
+ECS WEB (nginx)
+    │ http://<internal-alb-dns>
+    ▼
+Internal ALB (petclinic-was-internal-alb)
+    │ :9966
+    ▼
+ECS WAS (Spring Boot)
+```
+
+설정 절차는 아래 **[Internal ALB 추가 설정]** 섹션 참고.
+
+---
+
+## Internal ALB 추가 설정
+
+WEB → WAS 트래픽을 Internal ALB로 라우팅하기 위한 추가 구성.
+
+### Step 1. Security Group 생성 — petclinic-was-alb-sg
+
+> EC2 → 보안 그룹 → **보안 그룹 생성**
+
+| 항목 | 값 |
+|------|-----|
+| 이름 | `petclinic-was-alb-sg` |
+| VPC | `petclinic-vpc` |
+
+**인바운드 규칙:**
+
+| 유형 | 프로토콜 | 포트 | 소스 |
+|------|----------|------|------|
+| HTTP | TCP | 80 | WEB 컨테이너 보안 그룹 (`petclinic-web-sg` 또는 Private 서브넷 CIDR) |
+
+**아웃바운드 규칙:** 모든 트래픽 허용 (기본값 유지)
+
+---
+
+### Step 2. WAS Security Group 인바운드 규칙 추가
+
+> EC2 → 보안 그룹 → `petclinic-was-sg` → **인바운드 규칙 편집**
+
+| 유형 | 프로토콜 | 포트 | 소스 |
+|------|----------|------|------|
+| 사용자 지정 TCP | TCP | 9966 | `petclinic-was-alb-sg` |
+
+---
+
+### Step 3. Target Group 생성
+
+> EC2 → 대상 그룹 → **대상 그룹 생성**
+
+| 항목 | 값 |
+|------|-----|
+| 대상 유형 | **IP 주소** (awsvpc 네트워크 모드) |
+| 이름 | `petclinic-was-tg` |
+| 프로토콜 | HTTP |
+| 포트 | `9966` |
+| VPC | `petclinic-vpc` |
+
+**상태 검사 설정:**
+
+| 항목 | 값 |
+|------|-----|
+| 프로토콜 | HTTP |
+| 경로 | `/petclinic/actuator/health` |
+| 정상 임계값 | 2 |
+| 비정상 임계값 | 3 |
+| 제한 시간 | 5초 |
+| 간격 | 30초 |
+| 성공 코드 | `200` |
+
+> **경로 근거**: `server.servlet.context-path=/petclinic/` ([application.properties](../spring-petclinic-reactjs/src/main/resources/application.properties#L24)) + Spring Boot Actuator 기본 경로 `/actuator` = `/petclinic/actuator/health`. `spring-boot-starter-actuator` 의존성 포함([pom.xml](../spring-petclinic-reactjs/pom.xml)), 별도 management port 설정 없으므로 9966 포트에서 응답. 정상 시 HTTP 200, DB 연결 불가 시 HTTP 503 반환.
+
+대상 등록은 하지 않고 **생성** (ECS 서비스가 자동 등록).
+
+---
+
+### Step 4. Internal ALB 생성
+
+> EC2 → 로드 밸런서 → **로드 밸런서 생성** → Application Load Balancer
+
+| 항목 | 값 |
+|------|-----|
+| 이름 | `petclinic-was-internal-alb` |
+| 체계 | **내부 (Internal)** |
+| IP 주소 유형 | IPv4 |
+| VPC | `petclinic-vpc` |
+| 서브넷 | Private 서브넷 2개: `10.0.11.0/24` (2a), `10.0.12.0/24` (2c) |
+| 보안 그룹 | `petclinic-was-alb-sg` |
+
+**리스너:**
+
+| 프로토콜 | 포트 | 기본 작업 |
+|----------|------|-----------|
+| HTTP | 80 | `petclinic-was-tg`로 전달 |
+
+생성 완료 후 **DNS 이름** 복사 (예: `petclinic-was-internal-alb-xxxxxxxxx.ap-northeast-2.elb.amazonaws.com`)
+
+---
+
+### Step 5. WAS ECS 서비스에 Target Group 연결
+
+> ECS → 클러스터 → `petclinic-cluster` → `petclinic-was-svc` → **업데이트**
+
+- **로드 밸런싱** 섹션 → **로드 밸런서 추가**
+  - 로드 밸런서: `petclinic-was-internal-alb`
+  - 컨테이너: `petclinic-was` : `9966`
+  - 대상 그룹: `petclinic-was-tg`
+- **업데이트** → WAS 재배포 대기
+
+WAS 태스크가 **Running** + 대상 그룹 상태 **healthy** 확인 후 진행.
+
+---
+
+### Step 6. nginx.conf + Dockerfile 확인
+
+`nginx.conf`는 ALB DNS를 placeholder로 유지 (코드에 하드코딩하지 않음):
+
+```nginx
+server {
+    listen 80;
+
+    resolver 169.254.169.253 valid=10s ipv6=off;
+
+    location = /health {
+        return 200 'OK';
+        add_header Content-Type text/plain;
+    }
+
+    location /petclinic/ {
+        set $backend http://INTERNAL_ALB_DNS_PLACEHOLDER;
+        proxy_pass $backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+`Dockerfile`은 컨테이너 시작 시 환경변수 `WAS_ALB_DNS`로 placeholder를 치환:
+
+```dockerfile
+FROM public.ecr.aws/docker/library/nginx:1.25-alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["/bin/sh", "-c", "sed -i 's|INTERNAL_ALB_DNS_PLACEHOLDER|'\"$WAS_ALB_DNS\"'|g' /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
+```
+
+> ALB DNS를 코드에 하드코딩하지 않으므로 ALB가 재생성되어도 ECS 태스크 정의의 환경변수만 수정하면 됨. 코드 수정/재배포 불필요.
+
+---
+
+### Step 6-1. WEB ECS 태스크 정의에 환경변수 추가
+
+> ECS → 태스크 정의 → `petclinic-web` → **새 개정 생성**
+
+컨테이너 `petclinic-web` → **환경 변수** 섹션에 추가:
+
+| 키 | 값 |
+|----|-----|
+| `WAS_ALB_DNS` | `petclinic-was-internal-alb-xxxxxxxxx.ap-northeast-2.elb.amazonaws.com` |
+
+값은 Step 4에서 복사한 Internal ALB DNS 이름으로 채울 것.
+
+새 개정 저장 후 → `petclinic-web-svc` 서비스 업데이트 → 새 태스크 정의 개정 선택 → 배포.
+
+---
+
+### Step 7. WEB ECS 서비스 Service Connect 비활성화 (선택)
+
+Internal ALB를 통해 라우팅하므로 WEB 서비스의 Service Connect 클라이언트 구성이 불필요.
+
+> ECS → `petclinic-web-svc` → **업데이트** → **서비스 연결** → **비활성화**
+
+Envoy 사이드카가 제거되어 WEB 태스크 리소스 사용량이 감소.
+
+---
+
+### Step 8. 코드 변경 후 배포
+
+nginx.conf와 Dockerfile 수정 후 git push → WEB 파이프라인 자동 실행 → 배포 완료.
