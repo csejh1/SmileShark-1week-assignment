@@ -7,13 +7,14 @@ import { browserHistory as history } from 'react-router';
 
 require('./styles/less/petclinic.less');
 
+// 테스트용 주석
 // The Application
 import Root from './Root';
 
 // Render Application
 const mountPoint = document.getElementById('mount');
 ReactDOM.render(
-  <AppContainer><Root history={history}/></AppContainer>,
+  <AppContainer><Root history={history} /></AppContainer>,
   mountPoint
 );
 
